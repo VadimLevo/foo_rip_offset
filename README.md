@@ -22,7 +22,7 @@
 
 1. Select the tracks in your playlist that require offset correction.
 2. Right-click the selection and choose **Apply Rip Offset...**.
-3. Enter the required offset value in samples (e.g., `+30` or `-664`).
+3. Enter the required offset correction value in samples (e.g., `+30` or `-664`).
 4. Select your preferred output directory and subfolder options.
 5. Click **OK** to process the files.
 
@@ -44,7 +44,7 @@
 
 1. Выделите нужные треки в плейлисте foobar2000.
 2. Нажмите правой кнопкой мыши и выберите **Apply Rip Offset...**.
-3. Введите значение оффсета в сэмплах (например, `+30` или `-664`).
+3. Введите значение коррекции оффсета в сэмплах (например, `+30` или `-664`).
 4. Настройте директорию сохранения и вложенную папку.
 5. Нажмите **ОК** для запуска обработки.
 
