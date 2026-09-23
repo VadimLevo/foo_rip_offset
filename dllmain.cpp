@@ -9,7 +9,7 @@
 // --- Декларация компонента ---
 DECLARE_COMPONENT_VERSION(
     "AccurateRip Offset Fixer",
-    "1.0",
+    "1.0.1",
     "Bit-perfect sample shifting across track boundaries for AccurateRip correction."
 );
 
@@ -137,43 +137,13 @@ public:
         t_size total_items = m_items.get_count();
 
         std::vector<audio_sample> saved_tail;
-        size_t album_channels = 0;
-        size_t album_sample_rate = 0;
 
         for (t_size i = 0; i < total_items; ++i) {
             p_abort.check();
             p_status.set_progress(i, total_items);
             p_status.set_item_path(m_items[i]->get_path());
 
-            // 1. Декодируем весь текущий трек в память
-            ih.open(nullptr, m_items[i], input_flag_no_looping, p_abort, false, false);
-
-            audio_chunk_impl chunk;
-            std::vector<audio_sample> current_track_data;
-
-            bool format_initialized = false;
-            size_t channels = 0;
-            size_t sample_rate = 0;
-
-            while (ih.run(chunk, p_abort)) {
-                if (!format_initialized) {
-                    channels = chunk.get_channels();
-                    sample_rate = chunk.get_srate();
-                    if (i == 0) {
-                        album_channels = channels;
-                        album_sample_rate = sample_rate;
-                    }
-                    format_initialized = true;
-                }
-                const audio_sample* data = chunk.get_data();
-                size_t total_samples = chunk.get_sample_count() * channels;
-                current_track_data.insert(current_track_data.end(), data, data + total_samples);
-            }
-            ih.close();
-
-            size_t total_frames = current_track_data.size() / channels;
-
-            // 2. Формируем путь вывода
+            // 1. Формируем уникальный путь вывода (с учетом CUE/subsong)
             pfc::string8 in_path = m_items[i]->get_path();
             if (strncmp(in_path.get_ptr(), "file://", 7) == 0) in_path.remove_chars(0, 7);
 
@@ -197,60 +167,198 @@ public:
             std::error_code ec;
             std::filesystem::create_directories(out_dir, ec);
 
-            std::filesystem::path out_file = out_dir / orig_path.filename();
-            std::wstring final_path_str = out_file.wstring() + L".fixed.wav";
+            // Если файл содержит сабсонги (CUE sheet), добавляем номер трека к имени
+            std::wstring out_filename = orig_path.stem().wstring();
+            uint32_t subsong = m_items[i]->get_subsong_index();
+            if (subsong > 0) {
+                wchar_t buf[32];
+                swprintf_s(buf, L".track%02u", subsong);
+                out_filename += buf;
+            }
+            out_filename += orig_path.extension().wstring() + L".fixed.wav";
 
+            std::filesystem::path out_file = out_dir / out_filename;
+            std::wstring final_path_str = out_file.wstring();
+
+            // 2. Открываем входной трек
+            ih.open(nullptr, m_items[i], input_flag_no_looping, p_abort, false, false);
+
+            audio_chunk_impl chunk;
             WavWriter writer;
-            writer.open(final_path_str, sample_rate, channels);
+            bool writer_initialized = false;
+            size_t channels = 0;
+            size_t sample_rate = 0;
 
-            // 3. Применяем математику сдвига
+            uint64_t total_track_samples = 0;
+            uint64_t processed_track_samples = 0;
+            size_t chunk_counter = 0;
+
+            // 3. Обработка потока кусочками (Chunk Streaming) без загрузки файла в RAM
             if (m_offset < 0) {
                 size_t skip_frames = static_cast<size_t>(-m_offset);
-                size_t borrow_frames = skip_frames;
+                size_t skip_samples = 0;
+                size_t skipped_samples = 0;
 
-                if (skip_frames < total_frames) {
-                    size_t offset_samples = skip_frames * channels;
-                    writer.write_samples(current_track_data.data() + offset_samples, total_frames - skip_frames);
+                while (ih.run(chunk, p_abort)) {
+                    if (!writer_initialized) {
+                        channels = chunk.get_channels();
+                        sample_rate = chunk.get_srate();
+                        skip_samples = skip_frames * channels;
+
+                        double duration = m_items[i]->get_length();
+                        if (duration > 0 && sample_rate > 0) {
+                            total_track_samples = static_cast<uint64_t>(duration * sample_rate);
+                        }
+
+                        writer.open(final_path_str, static_cast<int>(sample_rate), static_cast<int>(channels));
+                        writer_initialized = true;
+                    }
+
+                    size_t chunk_frames = chunk.get_sample_count();
+                    processed_track_samples += chunk_frames;
+                    if (total_track_samples > 0 && (++chunk_counter % 16 == 0)) {
+                        double track_progress = static_cast<double>(processed_track_samples) / total_track_samples;
+                        if (track_progress > 1.0) track_progress = 1.0;
+                        double global_progress = ((double)i + track_progress) / total_items;
+                        p_status.set_progress(static_cast<t_size>(global_progress * 1000), 1000);
+                    }
+
+                    const audio_sample* data = chunk.get_data();
+                    size_t chunk_samples = chunk_frames * channels;
+
+                    // Пропускаем начальные сэмплы (Negative Offset)
+                    if (skipped_samples < skip_samples) {
+                        size_t needed_skip = skip_samples - skipped_samples;
+                        if (chunk_samples <= needed_skip) {
+                            skipped_samples += chunk_samples;
+                            continue;
+                        }
+                        else {
+                            data += needed_skip;
+                            chunk_samples -= needed_skip;
+                            skipped_samples += needed_skip;
+                        }
+                    }
+
+                    if (chunk_samples > 0) {
+                        writer.write_samples(data, chunk_samples / channels);
+                    }
                 }
+                ih.close();
 
+                if (!writer_initialized) continue;
+
+                // Заимствуем хвост из следующего трека или заполняем тишиной
                 if (i + 1 < total_items) {
                     std::vector<audio_sample> borrowed;
-                    read_first_samples(m_items[i + 1], borrow_frames, borrowed, p_abort);
-                    writer.write_samples(borrowed.data(), borrow_frames);
+                    read_first_samples(m_items[i + 1], skip_frames, borrowed, p_abort);
+                    if (!borrowed.empty()) {
+                        writer.write_samples(borrowed.data(), borrowed.size() / channels);
+                    }
                 }
                 else {
-                    std::vector<audio_sample> silence(borrow_frames * channels, 0.0f);
-                    writer.write_samples(silence.data(), borrow_frames);
+                    std::vector<audio_sample> silence(skip_samples, 0.0f);
+                    writer.write_samples(silence.data(), skip_frames);
                 }
 
             }
             else if (m_offset > 0) {
                 size_t shift_frames = static_cast<size_t>(m_offset);
-                size_t shift_samples = shift_frames * channels;
+                size_t shift_samples = 0;
+                std::vector<audio_sample> pending_buffer;
 
-                if (i == 0) {
+                while (ih.run(chunk, p_abort)) {
+                    if (!writer_initialized) {
+                        channels = chunk.get_channels();
+                        sample_rate = chunk.get_srate();
+                        shift_samples = shift_frames * channels;
+
+                        double duration = m_items[i]->get_length();
+                        if (duration > 0 && sample_rate > 0) {
+                            total_track_samples = static_cast<uint64_t>(duration * sample_rate);
+                        }
+
+                        writer.open(final_path_str, static_cast<int>(sample_rate), static_cast<int>(channels));
+                        writer_initialized = true;
+
+                        // В начале трека пишем накопленный хвост или тишину
+                        if (i == 0) {
+                            std::vector<audio_sample> silence(shift_samples, 0.0f);
+                            writer.write_samples(silence.data(), shift_frames);
+                        }
+                        else {
+                            if (!saved_tail.empty()) {
+                                writer.write_samples(saved_tail.data(), saved_tail.size() / channels);
+                                saved_tail.clear();
+                            }
+                        }
+                    }
+
+                    size_t chunk_frames = chunk.get_sample_count();
+                    processed_track_samples += chunk_frames;
+                    if (total_track_samples > 0 && (++chunk_counter % 16 == 0)) {
+                        double track_progress = static_cast<double>(processed_track_samples) / total_track_samples;
+                        if (track_progress > 1.0) track_progress = 1.0;
+                        double global_progress = ((double)i + track_progress) / total_items;
+                        p_status.set_progress(static_cast<t_size>(global_progress * 1000), 1000);
+                    }
+
+                    const audio_sample* data = chunk.get_data();
+                    size_t chunk_samples = chunk_frames * channels;
+                    pending_buffer.insert(pending_buffer.end(), data, data + chunk_samples);
+
+                    // Сбрасываем лишние сэмплы на диск, оставляя ровно shift_samples в задержке
+                    if (pending_buffer.size() > shift_samples) {
+                        size_t write_count = pending_buffer.size() - shift_samples;
+                        writer.write_samples(pending_buffer.data(), write_count / channels);
+                        pending_buffer.erase(pending_buffer.begin(), pending_buffer.begin() + write_count);
+                    }
+                }
+                ih.close();
+
+                if (!writer_initialized) continue;
+
+                // Оставшийся в задержке буфер переходит в хвост для следующего трека
+                saved_tail = pending_buffer;
+
+                // Если это последний трек — дописываем хвост и тишину
+                if (i == total_items - 1) {
+                    if (!saved_tail.empty()) {
+                        writer.write_samples(saved_tail.data(), saved_tail.size() / channels);
+                    }
                     std::vector<audio_sample> silence(shift_samples, 0.0f);
                     writer.write_samples(silence.data(), shift_frames);
-                }
-                else {
-                    writer.write_samples(saved_tail.data(), saved_tail.size() / channels);
-                }
-
-                if (total_frames > shift_frames) {
-                    size_t body_frames = total_frames - shift_frames;
-                    writer.write_samples(current_track_data.data(), body_frames);
-
-                    size_t tail_start_sample = body_frames * channels;
-                    saved_tail.assign(current_track_data.begin() + tail_start_sample, current_track_data.end());
-                }
-                else {
-                    writer.write_samples(current_track_data.data(), total_frames);
-                    saved_tail.assign(current_track_data.begin(), current_track_data.end());
                 }
 
             }
             else {
-                writer.write_samples(current_track_data.data(), total_frames);
+                // Offset = 0 (простая попотоковая запись)
+                while (ih.run(chunk, p_abort)) {
+                    if (!writer_initialized) {
+                        channels = chunk.get_channels();
+                        sample_rate = chunk.get_srate();
+
+                        double duration = m_items[i]->get_length();
+                        if (duration > 0 && sample_rate > 0) {
+                            total_track_samples = static_cast<uint64_t>(duration * sample_rate);
+                        }
+
+                        writer.open(final_path_str, static_cast<int>(sample_rate), static_cast<int>(channels));
+                        writer_initialized = true;
+                    }
+
+                    size_t chunk_frames = chunk.get_sample_count();
+                    processed_track_samples += chunk_frames;
+                    if (total_track_samples > 0 && (++chunk_counter % 16 == 0)) {
+                        double track_progress = static_cast<double>(processed_track_samples) / total_track_samples;
+                        if (track_progress > 1.0) track_progress = 1.0;
+                        double global_progress = ((double)i + track_progress) / total_items;
+                        p_status.set_progress(static_cast<t_size>(global_progress * 1000), 1000);
+                    }
+
+                    writer.write_samples(chunk.get_data(), chunk_frames);
+                }
+                ih.close();
             }
 
             writer.close();
@@ -276,10 +384,7 @@ public:
             // 5. Копируем вшитую обложку (Album Art)
             pfc::string8 src_url = m_items[i]->get_path();
             try {
-                // g_open первым аргументом принимает file_ptr (передаём nullptr),
-                // а возвращает готовый указатель на экстрактор/редактор.
                 album_art_extractor_instance_ptr extractor = album_art_extractor::g_open(nullptr, src_url.get_ptr(), p_abort);
-
                 album_art_editor_instance_ptr editor = album_art_editor::g_open(nullptr, out_url.get_ptr(), p_abort);
 
                 static const GUID* const art_types[] = {
@@ -298,9 +403,7 @@ public:
                             modified = true;
                         }
                     }
-                    catch (const exception_album_art_not_found&) {
-                        // Нет конкретного типа обложки - это нормально, идём дальше
-                    }
+                    catch (const exception_album_art_not_found&) {}
                     catch (...) {}
                 }
 
@@ -308,12 +411,8 @@ public:
                     editor->commit(p_abort);
                 }
             }
-            catch (const exception_album_art_not_found&) {
-                // У исходного файла вообще нет обложек - штатная ситуация
-            }
-            catch (const exception_album_art_unsupported_format&) {
-                // Исходный или целевой формат не поддерживает работу с обложками
-            }
+            catch (const exception_album_art_not_found&) {}
+            catch (const exception_album_art_unsupported_format&) {}
             catch (const std::exception& e) {
                 FB2K_console_formatter() << "foo_rip_offset: Failed to copy album art - " << e.what();
             }
